@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""Generate an OpenCode (V2) theme from the current Caelestia colour scheme.
+
+Reads the scheme either from the ``SCHEME_COLOURS`` / ``SCHEME_MODE``
+environment variables (set by Caelestia's ``theme.postHook``) or, when run
+standalone, from ``~/.local/state/caelestia/scheme.json``.
+
+Writes ``~/.config/opencode/themes/caelestia.json`` (the file name is the theme
+name in OpenCode), then nudges running OpenCode TUIs with ``SIGUSR2`` so they
+re-read their theme files without a restart.
+"""
+
+from __future__ import annotations
+
+import argparse
+import colorsys
+import json
+import os
+import signal
+import sys
+import tempfile
+from pathlib import Path
+
+STATE = Path(os.getenv("XDG_STATE_HOME", Path.home() / ".local/state"))
+CONFIG = Path(os.getenv("XDG_CONFIG_HOME", Path.home() / ".config"))
+DEFAULT_SCHEME = STATE / "caelestia" / "scheme.json"
+DEFAULT_OUTPUT = CONFIG / "opencode" / "themes" / "caelestia.json"
+
+SIGUSR2 = 12
+SIGUSR2_BIT = 1 << (SIGUSR2 - 1)
+
+
+def hex_to_rgb(value: str) -> tuple[float, float, float]:
+    value = value.lstrip("#")
+    return tuple(int(value[i : i + 2], 16) / 255 for i in (0, 2, 4))  # type: ignore[return-value]
+
+
+def rgb_to_hex(r: float, g: float, b: float) -> str:
+    return "%02x%02x%02x" % tuple(max(0, min(255, round(x * 255))) for x in (r, g, b))
+
+
+def ramp(seed: str, mode: str) -> dict[str, str]:
+    """Build a 9-step hue scale from a single seed colour.
+
+    Dark themes run light (100) -> dark (900); light themes run dark (100) ->
+    light (900). Hue is preserved and saturation is kept roughly stable.
+    """
+    r, g, b = hex_to_rgb(seed)
+    hue, _, sat = colorsys.rgb_to_hls(r, g, b)
+
+    lightness = (
+        [0.93, 0.83, 0.73, 0.63, 0.53, 0.43, 0.33, 0.23, 0.13]
+        if mode == "dark"
+        else [0.20, 0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.89, 0.95]
+    )
+
+    out: dict[str, str] = {}
+    for i, light in enumerate(lightness):
+        s = sat
+        if i <= 1:
+            s = min(s, 0.60)
+        elif i == 8:
+            s = min(s, 0.80)
+        s = max(0.16, min(0.82, s))
+        out[str((i + 1) * 100)] = "#" + rgb_to_hex(*colorsys.hls_to_rgb(hue, light, s))
+    return out
+
+
+def gray_scale(c: dict[str, str]) -> dict[str, str]:
+    """Anchor the neutral scale on the real Material surface/on-surface tones so
+    the TUI background matches the rest of the desktop exactly."""
+    return {
+        "100": "#" + c["onSurface"],
+        "200": "#" + c["onSurface"],
+        "300": "#" + c["onSurfaceVariant"],
+        "400": "#" + c["outline"],
+        "500": "#" + c["surfaceContainerHighest"],
+        "600": "#" + c["surfaceContainerHigh"],
+        "700": "#" + c["surfaceContainerLow"],
+        "800": "#" + c["surface"],
+        "900": "#" + c["surfaceContainerLowest"],
+    }
+
+
+# Complete `base` token tree (mirrors OpenCode's built-in default theme).
+BASE: dict[str, object] = {
+    "categorical": ["blue", "purple", "green", "orange", "red"],
+    "text": {
+        "base": "$hue.neutral.200",
+        "muted": "$hue.neutral.400",
+        "action": {
+            "primary": {
+                "base": "$text.base",
+                "$disabled": "$hue.neutral.400",
+                "$focused": "$hue.neutral.800",
+                "$selected": "$hue.interactive.200",
+            },
+            "secondary": {"base": "$text.muted", "$hovered": "$text.base"},
+            "destructive": {"base": "$hue.neutral.800", "$disabled": "$hue.neutral.400"},
+        },
+        "formfield": {
+            "base": "$hue.neutral.200",
+            "$hovered": "$hue.interactive.200",
+            "$focused": "$hue.interactive.200",
+            "$pressed": "$hue.interactive.200",
+            "$disabled": "$hue.neutral.400",
+            "$selected": "$hue.interactive.200",
+        },
+        "feedback": {
+            "error": {"base": "$hue.red.200"},
+            "warning": {"base": "$hue.orange.200"},
+            "success": {"base": "$hue.green.200"},
+            "info": {"base": "$hue.cyan.200"},
+        },
+    },
+    "background": {
+        "base": "$hue.neutral.800",
+        "raised": {
+            "base": "$hue.neutral.700",
+            "high": "$hue.neutral.600",
+            "max": "$hue.neutral.500",
+        },
+        "action": {
+            "primary": {
+                "base": "transparent",
+                "$hovered": "$hue.neutral.700",
+                "$focused": "$hue.interactive.200",
+                "$selected": "transparent",
+            },
+            "secondary": {"base": "transparent"},
+            "destructive": {"base": "$hue.red.200"},
+        },
+        "formfield": {"base": "$background.base"},
+        "feedback": {
+            "error": {"base": "$background.base"},
+            "warning": {"base": "$background.base"},
+            "success": {"base": "$background.base"},
+            "info": {"base": "$background.base"},
+        },
+    },
+    "border": {"base": "$hue.neutral.400"},
+    "scrollbar": {"base": "$hue.neutral.400"},
+    "diff": {
+        "text": {
+            "added": "$hue.green.300",
+            "removed": "$hue.red.300",
+            "context": "$hue.neutral.400",
+            "hunkHeader": "$hue.neutral.400",
+        },
+        "background": {
+            "added": "$hue.green.900",
+            "removed": "$hue.red.900",
+            "context": "$hue.neutral.700",
+        },
+        "highlight": {"added": "$hue.green.200", "removed": "$hue.red.200"},
+        "lineNumber": {
+            "text": "$hue.neutral.400",
+            "background": {"added": "$hue.green.800", "removed": "$hue.red.800"},
+        },
+    },
+    "syntax": {
+        "comment": "$hue.neutral.400",
+        "keyword": "$hue.accent.200",
+        "function": "$hue.interactive.200",
+        "variable": "$hue.red.200",
+        "string": "$hue.green.200",
+        "number": "$hue.orange.200",
+        "type": "$hue.cyan.200",
+        "operator": "$hue.cyan.200",
+        "punctuation": "$hue.neutral.200",
+    },
+    "markdown": {
+        "text": "$hue.neutral.200",
+        "heading": "$hue.accent.200",
+        "link": "$hue.interactive.200",
+        "linkText": "$hue.cyan.200",
+        "code": "$hue.green.200",
+        "blockQuote": "$hue.neutral.400",
+        "emphasis": "$hue.orange.200",
+        "strong": "$hue.orange.200",
+        "horizontalRule": "$hue.neutral.400",
+        "listItem": "$hue.interactive.200",
+        "listEnumeration": "$hue.cyan.200",
+        "image": "$hue.interactive.200",
+        "imageText": "$hue.cyan.200",
+        "codeBlock": "$hue.neutral.200",
+    },
+    "@dialog": {
+        "background": {
+            "base": "$background.raised.base",
+            "action": {"primary": {"$hovered": "$background.raised.high"}},
+        }
+    },
+}
+
+# Caelestia scheme role -> OpenCode hue family. Tweak these to taste.
+HUE_SOURCES = {
+    "red": "error",
+    "orange": "tertiary",
+    "green": "success",
+    "cyan": "secondary",
+    "blue": "term4",
+    "purple": "primary",
+}
+ACCENT = "purple"
+INTERACTIVE = "blue"
+
+
+def hue_palette(c: dict[str, str], mode: str) -> dict[str, object]:
+    palette: dict[str, object] = {"gray": gray_scale(c)}
+    for name, role in HUE_SOURCES.items():
+        palette[name] = ramp(c[role], mode)
+    palette["accent"] = f"$hue.{ACCENT}"
+    palette["interactive"] = f"$hue.{INTERACTIVE}"
+    palette["neutral"] = "$hue.gray"
+    return palette
+
+
+def build(colours: dict[str, str], mode: str) -> dict[str, object]:
+    # The generated file only carries the mode Caelestia is currently in; the
+    # palette is emitted under that key so OpenCode resolves it correctly.
+    key = "light" if mode == "light" else "dark"
+    return {
+        "$schema": "https://opencode.ai/theme.json",
+        "base": BASE,
+        key: {"hue": hue_palette(colours, mode)},
+    }
+
+
+def load_scheme(path: Path) -> tuple[dict[str, str], str]:
+    colours_env = os.getenv("SCHEME_COLOURS")
+    mode_env = os.getenv("SCHEME_MODE")
+    if colours_env:
+        return json.loads(colours_env), mode_env or "dark"
+    data = json.loads(path.read_text())
+    return data["colours"], data.get("mode", "dark")
+
+
+def atomic_write(path: Path, content: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=path.parent)
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.replace(tmp, path)
+    except BaseException:
+        os.unlink(tmp)
+        raise
+
+
+def nudge_opencode() -> list[int]:
+    """Ask running OpenCode TUIs to re-read their theme files.
+
+    OpenCode's TUI subscribes to ``SIGUSR2`` (the ``Theme`` store's
+    ``subscribeRefresh``) and, on receipt, re-scans the global/project
+    ``themes/`` directories and applies the new tokens about a second later.
+    Its background service does NOT handle ``SIGUSR2``, so only processes that
+    actually catch the signal are signalled (checked via ``/proc/<pid>/status``).
+    """
+    signalled: list[int] = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == os.getpid():
+            continue
+        try:
+            args = [a.decode(errors="replace") for a in (entry / "cmdline").read_bytes().split(b"\0") if a]
+        except OSError:
+            continue
+        if not args or Path(args[0]).name != "opencode":
+            continue
+        try:
+            status = (entry / "status").read_text()
+        except OSError:
+            continue
+        caught = False
+        for line in status.splitlines():
+            if line.startswith("SigCgt:"):
+                caught = bool(int(line.split()[1], 16) & SIGUSR2_BIT)
+                break
+        if not caught:
+            continue  # e.g. `opencode serve --service`; signalling it would kill it
+        try:
+            os.kill(pid, SIGUSR2)
+            signalled.append(pid)
+        except OSError:
+            pass
+    return signalled
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("-s", "--scheme", type=Path, default=DEFAULT_SCHEME, help="Caelestia scheme.json to read")
+    parser.add_argument("-o", "--output", type=Path, default=DEFAULT_OUTPUT, help="where to write the OpenCode theme")
+    parser.add_argument("--stdout", action="store_true", help="print the theme instead of writing it")
+    parser.add_argument("--no-nudge", action="store_true", help="do not signal running OpenCode TUIs")
+    args = parser.parse_args(argv)
+
+    colours, mode = load_scheme(args.scheme)
+    theme = build(colours, mode)
+    content = json.dumps(theme, indent=2) + "\n"
+
+    if args.stdout:
+        sys.stdout.write(content)
+        return 0
+
+    atomic_write(args.output, content)
+    if not args.no_nudge:
+        try:
+            nudge_opencode()
+        except Exception:  # never let a nudge failure break theme generation
+            pass
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
